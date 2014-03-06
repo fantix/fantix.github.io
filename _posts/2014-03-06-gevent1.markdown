@@ -1,0 +1,242 @@
+---
+layout: post
+title:  "gevent 迁移 Python 3 历程（一）"
+date:   2014-03-06 16:47:06
+categories: python
+---
+
+时隔一年多，gevent 的作者 Denis Bilenko 终于从创业的百忙之中，抽出时间打算 review 我在 2012 年的时候完成的 [gevent 到 Python 3 的迁移工作][2]。
+
+Skype 交谈中，Denis 问了几个问题，我发现有不少改动我已经忘记了当初写的原因了，**这个案例教育我们，在做较大的修改的时候，尽量拆分成多个较小的提交，每个提交消息都尽量写清楚。**^_^
+
+因为过了一年多，gevent 的 master 上也改动了一些。我尝试了做 merge，发现结果不是很理想，再加上对当时修改又不是很满意了，于是乎，我选择了参考原来的改动，重新迁移一次。
+
+插叙一段小插曲。其实在 Denis 联系我之前，我已经放弃他了——因为他实在是很久很久没有在 gevent 上活跃开发了，gevent 1.0 感觉也是憋了好久憋出来的。当时连蟒爹的 [Tulip/asyncio][3] 都眼瞅着要发布了，我就直接 fork 了个项目叫 [gevent3][4]，也就是 Python 3 版的、基于 [asyncio][3] 的 gevent，这个 [gevent3][4] 有机会再跟大家介绍。没想到刚 fork 完没做多久，就发生了故事开头写的事情。
+
+言归正传。接下来我分段介绍我这几个月用业余时间*几乎*做完的第二次迁移工作，希望能对也在做向 Python 3 迁移工作的同学们有点帮助。
+
+Denis 对迁移工作的要求是，用同一套代码，同时支持 Python 2.6, 2.7 和 3.3。除了 greenlet，最好不要再引入其他的依赖，甚至是 [six][5]——一个专注于解决用同一套代码支持不同 Python 版本问题的库。
+
+## 软柿子 ##
+
+老虎吃天，无从下口。面对庞大的代码量，还得先捡软柿子捏。
+
+比如说，Python 3 用 `int` 替代了 Python 2 的 `long`（和 `int`）。[six][5] 对这种情况有这么一段定义：
+
+```python
+if PY3:
+    integer_types = int,
+else:
+    integer_types = (int, long)
+```
+
+那么就可以简单地把所有能换成 `integer_types` 的地方都换成 `integer_types`，就像这样：
+
+```diff
+         def __init__(self, fileno, mode=None, close=True):
+-            if not isinstance(fileno, (int, long)):
++            if not isinstance(fileno, integer_types):
+                 raise TypeError('fileno must be int: %r' % fileno)
+```
+
+类似的软柿子还有：
+
+```python
+if PY3:
+    string_types = str,
+    integer_types = int,
+    text_type = str
+    xrange = range
+else:
+    string_types = basestring,
+    integer_types = (int, long)
+    text_type = unicode
+    xrange = xrange
+```
+
+这些替换都是很简单的，虽然只是一个开始，但是可以让接下来更复杂的工作有一个好的开始。请参考：<https://pythonhosted.org/six/#constants>
+
+## 乾坤大挪移 ##
+
+Python 3 中，很多模块都改了名字，幸好多半接口并没有变化，所以为了同时能够支持 Python 2 和 3，可以简单地这么搞：
+
+```diff
+-from Queue import Full, Empty
++try:
++    from Queue import Full, Empty
++except ImportError:
++    from queue import Full, Empty
+```
+
+或者这样搞：
+
+```diff
+-import urllib2
++try:
++    import urllib2
++except ImportError:
++    from urllib import request as urllib2
+```
+
+还有一些其他不少重命名和重新规划，请参见：<http://python3porting.com/stdlib.html>
+
+## 将来时 ##
+
+在 Python 3 中，`print` 变成了一个函数，这直接意味着这样的代码是语法错误的：
+
+```python
+print "Hello, world!"
+```
+
+为了实现同一份代码同时支持 Python 2 和 3，这里我们可以用到一个叫做 `__future__` 的 `import`——这个 `import` 可以在某些老版本的 Python 中添加一些新版本才有的语言特性。对于 `print` 来说，Python 3 风格的 `print()` 函数自 Python 2.6 起开始出现在 `__future__` 中。谢天谢地，gevent 及时摒弃了 Python 2.5 的支持，我们可以统一使用 Python 3 风格的 `print()` 来写所有代码，而做到这一点只需要在所有用到 `print` 的 Python 文件开头写这么一句：
+
+```python
+from __future__ import print_function
+```
+
+这样一来，这些文件就可以使用 Python 3 风格的 `print()` 函数了。最抓人的是，如果以后打算放弃 Python 2 支持的话，只需要（甚至不需要）把这一行 `import` 语句删掉就可以了。
+
+要注意的是，`from __future__ import ...` 必须出现在所有非注释类代码的前面。
+
+更多细节可以参考这里：<http://docs.python.org/3/library/__future__.html>
+
+ps: 还有个小插曲。gevent 的代码里从 Python 代码树拷贝了一些测试文件，比如 `greentests/2.6/test__xxxxxx.py`，用以测试 monkey patch 上去的 gevent 代码的正确性。这些测试只会在指定 Python 版本下才会执行，所以我就没有给 2.6 和 2.7 的代码加 `print_function`。奇怪的事情发生了！2.6 和 2.7 的某个测试居然开始抱怨说，`print "Hello, world!"` 语法错误！没查原因我就默默地把 2.6 和 2.7 的测试文件都加上了 `print_function`……结果咯，Denis 不愿意，还是得去查原因。最后发现 `greentest/monkey_test.py` 那货是亲自 `exec()` 的 2.6 和 2.7 下面的某些测试代码，而我给 `monkey_test.py` 也加上了 `print_function`……所以说，有 `exec()` 调用存在的情况下，**不要轻易相信 `from __future__ import xxxx` 只对当前文件起作用**！
+
+## 异常处理 ##
+
+这是轻敌了的一部分。
+
+一开始只是以为 Python 2 与 3 之间，异常处理的区别只在于语法——对于 Python 2.6 及以上版本只要这样改就好了：
+
+```diff
+ try:
+     1/0
+-except Exception, ex:
++except Exception as ex:
+     pass
+```
+
+原来这里有大买卖。
+
+同一段代码，最后加多一句：
+
+```python
+try:
+    1/0
+except Exception as ex:
+    pass
+print(ex)
+```
+
+在 Python 2 上是这样的结果：
+
+```
+$ python2.7 extest.py 
+integer division or modulo by zero
+```
+
+在 Python 3 上却是：
+
+```
+$ python3.3 extest.py 
+Traceback (most recent call last):
+  File "extest.py", line 5, in <module>
+    print(e)
+NameError: name 'ex' is not defined
+```
+
+原来，Python 3 去掉了 `sys.exc_clear()` 函数，把该行为嵌入了语言内部——也就是说，只要是出了 `except` 子句，Python 3 的解释器会自动清除异常状态，还会捎带手把异常变量引用（`as` 出来的那个）删掉。举个例子，还是同一段代码，稍微改一下：
+
+```python
+import sys
+try:
+    1/0
+except Exception as ex:
+    pass
+print(sys.exc_info())
+```
+
+在 Python 2 中执行：
+
+```
+$ python2.7 exclear.py 
+(<type 'exceptions.ZeroDivisionError'>, ZeroDivisionError('integer division or modulo by zero',), <traceback object at 0x104d1a0e0>)
+```
+
+但在 Python 3 中：
+
+```
+$ python3.3 exclear.py 
+(None, None, None)
+```
+
+原来如此！基于这些知识，gevent 的某些代码就得改了——原先在 `except` 子句中经常有 `exc_clear()` 之后又做了一些事情，现在就得改成在 `except` 子句外面来做这些事情。比如 `socket.recv()` 就得这么改（片段）：
+
+```diff
+     def recv(self, *args):
+         while True:
+             try:
+                 return sock.recv(*args)
+             except error as ex:
+                 if ex.args[0] != EWOULDBLOCK or self.timeout == 0.0:
+                     raise
+-                sys.exc_clear()
+-                self._wait(self._read_event)
++                if not PY3:
++                    sys.exc_clear()
++            self._wait(self._read_event)
+```
+
+我还是挺喜欢 Python 3 的这个改变的，因为这样一来异常处理就非常干净整洁了，`except` 子句画地为牢，有效地限制了无用信息的外漏；另外这种限制还可以在一定程度上建议人们，不要在 `except` 子句里面写太多的业务逻辑，把异常处理好，有啥事儿咱出来再说。
+
+另外，Python 3 还在异常的栈跟踪信息上做了一些改进，比如这么一段代码：
+
+```python
+try:
+    1/0
+except Exception as ex:
+    None.non_exist()
+```
+
+就是在处理异常的时候，又弄坏了别的东西。Python 2 执行是这样的：
+
+```
+$ python2.7 tb.py 
+Traceback (most recent call last):
+  File "tb.py", line 4, in <module>
+    None.non_exist()
+```
+
+Python 3：
+
+```
+$ python3.3 tb.py 
+Traceback (most recent call last):
+  File "tb.py", line 2, in <module>
+    1/0
+ZeroDivisionError: division by zero
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "tb.py", line 4, in <module>
+    None.non_exist()
+AttributeError: 'NoneType' object has no attribute 'non_exist'
+```
+
+高端、大气、上档次有木有！Python 3 是这么实现这种异常链的：
+
+1. 当第一个异常对象产生时，`traceback` 信息会保存在该对象的 `__traceback__` 属性中；
+2. 当第二个异常对象产生时，因为是在第一个异常的 `except` 子句中，所以第一个异常对象被保存在了第二个异常对象的 `__context__` 属性中（当然第二个异常的 `__traceback__` 属性同样保存了第二个异常的栈跟踪信息）；
+3. 依次这样链下去，你就会得到一个异常链，你可以通过访问比如 `ex.__context__.__context__.__traceback__` 来找到爷爷异常的栈跟踪信息。
+
+这个美好的功能在这次 gevent 的迁移最后引来了好大一个麻烦，等讲到时再细说。
+
+（未完待续，附项目地址：<https://github.com/fantix/gevent>）
+
+  [1]: http://zh.wikipedia.org/zh/%E9%B8%AD%E5%AD%90%E7%B1%BB%E5%9E%8B
+  [2]: https://github.com/fantix/gevent/tree/old_master
+  [3]: https://code.google.com/p/tulip
+  [4]: https://github.com/gevent3/gevent3
+  [5]: https://pythonhosted.org/six/
+
